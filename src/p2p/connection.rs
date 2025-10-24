@@ -1,3 +1,4 @@
+use crate::storage::stream::Stream;
 use async_trait::async_trait;
 use std::collections::HashMap;
 use std::error::Error as StdError;
@@ -8,17 +9,23 @@ use tokio_util::sync::CancellationToken;
 
 pub struct Server {
     inflight_requests: Arc<Mutex<HashMap<String, Arc<CancellationToken>>>>,
+    stream_storage: Arc<Stream>,
 }
 
 impl Server {
     pub fn new() -> Self {
-        // TODO: load config from config.toml file
         Server {
-            inflight_requests: Arc::new(Mutex::new(HashMap::new())),
+            inflight_requests: Arc::new(Mutex::new(HashMap::with_capacity(1024))),
+            stream_storage: Arc::new(Stream::new()),
         }
     }
-    pub async fn start(&self, cancel_token: Arc<CancellationToken>) -> tokio::io::Result<()> {
+
+    pub async fn start(
+        self: Arc<Self>,
+        cancel_token: Arc<CancellationToken>,
+    ) -> tokio::io::Result<()> {
         let listener = TcpListener::bind("0.0.0.0:8082").await?;
+
         loop {
             tokio::select! {
                 _ = cancel_token.cancelled() => {
@@ -29,7 +36,6 @@ impl Server {
                 accept_res = listener.accept() => {
                     match accept_res {
                         Ok((socket, addr)) => {
-
                             let req_id = format!("{}-{}", addr, std::time::SystemTime::now()
                                 .duration_since(std::time::UNIX_EPOCH)
                                 .unwrap()
@@ -37,14 +43,16 @@ impl Server {
 
                             let req_id_clone = req_id.clone();
                             self.inflight_requests.lock().unwrap().insert(req_id, cancel_token.clone());
-                            let inflight_requests = self.inflight_requests.clone();
 
                             println!("Accepted connection from {:?}", addr);
 
+
+                            let server_clone = Arc::clone(&self);
                             let socket_token = cancel_token.clone();
+
                             tokio::spawn(async move {
-                                Server::handle_connection(socket, socket_token).await;
-                                inflight_requests.lock().unwrap().remove(&req_id_clone);
+                                server_clone.handle_connection(socket, socket_token).await;
+                                server_clone.inflight_requests.lock().unwrap().remove(&req_id_clone);
                             });
                         }
                         Err(e) => {
@@ -75,9 +83,8 @@ impl Server {
         println!("Server stopped");
     }
 
-    async fn handle_connection(mut socket: TcpStream, cancel_token: Arc<CancellationToken>) {
+    async fn handle_connection(&self, mut socket: TcpStream, cancel_token: Arc<CancellationToken>) {
         let mut buf = vec![0u8; 4096];
-
         let mut read_acc: Vec<u8> = Vec::with_capacity(8192);
 
         socket.set_nodelay(true).ok();
@@ -101,15 +108,13 @@ impl Server {
                         }
                     };
 
-
                     read_acc.extend_from_slice(&buf[..n]);
 
-
                     while let Some((consumed, command)) = parse_command(&read_acc) {
-
                         read_acc.drain(..consumed);
 
-                        let resp = command.execute().await;
+
+                        let resp = command.execute(Arc::clone(&self.stream_storage)).await;
                         let response_str = match resp {
                             Ok(val) => format!("+{}\r\n", val),
                             Err(e) => format!("-Error: {}\r\n", e),
@@ -120,13 +125,11 @@ impl Server {
                             return;
                         }
 
-
                         if let Err(e) = socket.flush().await {
                             eprintln!("flush error: {:?}", e);
                             return;
                         }
                     }
-
 
                     if read_acc.capacity() > 65536 && read_acc.len() < 4096 {
                         read_acc.shrink_to(8192);
@@ -139,25 +142,45 @@ impl Server {
 
 #[async_trait]
 pub trait Command: Send + Sync {
-    async fn execute(&self) -> Result<String, Box<dyn StdError + Send + Sync>>;
+    async fn execute(
+        &self,
+        storage: Arc<Stream>,
+    ) -> Result<String, Box<dyn StdError + Send + Sync>>;
 }
 
 pub struct GetCommand {
     pub key: String,
     pub args: HashMap<String, Vec<String>>,
 }
+pub struct SetCommand {
+    pub key: String,
+    pub value: Vec<u8>,
+}
 
 #[async_trait]
 impl Command for GetCommand {
-    async fn execute(&self) -> Result<String, Box<dyn StdError + Send + Sync>> {
-        if let Some(names) = self.args.get("Names") {
-            Ok(format!(
-                "Value for key '{}' with names: {:?}",
-                self.key, names
-            ))
-        } else {
-            Ok(format!("Value for key '{}'", self.key))
+    async fn execute(
+        &self,
+        storage: Arc<Stream>,
+    ) -> Result<String, Box<dyn StdError + Send + Sync>> {
+        let names = self.args.get("Names").map(|v| v.as_slice()).unwrap_or(&[]);
+
+        let result = storage.get(&self.key, names);
+        match result {
+            Some(value) => Ok(value),
+            None => Ok(String::from("Key not found")),
         }
+    }
+}
+
+#[async_trait]
+impl Command for SetCommand {
+    async fn execute(
+        &self,
+        storage: Arc<Stream>,
+    ) -> Result<String, Box<dyn StdError + Send + Sync>> {
+        storage.set(self.key.clone(), self.value.clone());
+        Ok(String::from("OK"))
     }
 }
 
@@ -211,10 +234,11 @@ fn parse_command(buf: &[u8]) -> Option<(usize, Box<dyn Command>)> {
     let mut args = HashMap::with_capacity(elements.len().saturating_sub(2));
 
     for arg in &elements[2..] {
-        if let Some(eq_pos) = arg.find('=') {
+        if let Some(eq_pos) = memchr::memchr(b'=', arg.as_bytes()) {
             let k = &arg[..eq_pos];
             let v = &arg[eq_pos + 1..];
-            let vals: Vec<String> = v.split(',').map(String::from).collect();
+
+            let vals: Vec<String> = v.split(',').map(|s| s.to_string()).collect();
             args.insert(k.to_string(), vals);
         }
     }

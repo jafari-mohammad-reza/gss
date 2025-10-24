@@ -1,4 +1,5 @@
 mod p2p;
+mod storage;
 use std::sync::Arc;
 
 use tokio::signal;
